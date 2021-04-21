@@ -5,10 +5,9 @@ import gzip
 import sys
 import glob
 import logging
-from logging.handlers import QueueListener, QueueHandler
 import collections
 from optparse import OptionParser
-from multiprocessing import Process, Queue, Manager, Barrier
+from multiprocessing import Process, Queue, Array
 from itertools import islice
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
@@ -21,6 +20,8 @@ NORMAL_ERR_RATE = 0.01
 READ_LINES = 100000
 PROCESS_VALUE = 4
 QUEUE_MAXSIZE = 4
+MEMC_SOCKET_TIMEOUT = 5
+MEMC_DEAD_RETRY = 2
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
@@ -30,25 +31,14 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(logger, memc_addr, appsinstalled, dry_run=False):
+def serialize_data(appsinstalled):
     ua = appsinstalled_pb2.UserApps()
     ua.lat = appsinstalled.lat
     ua.lon = appsinstalled.lon
     key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
     ua.apps.extend(appsinstalled.apps)
     packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logger.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-    except Exception as e:
-        logger.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
+    return ua, key, packed
 
 
 def parse_appsinstalled(logger, line):
@@ -86,27 +76,25 @@ def prototest():
         assert ua == unpacked
 
 
-def get_stat(logger, counter, file):
-    if counter[file]['processed']:
-        err_rate = float(counter[file]['errors']) / counter[file]['processed']
-        if err_rate < NORMAL_ERR_RATE:
-            logger.info("Acceptable error rate (%s). Successfull load" % err_rate)
-        else:
-            logger.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
-    dot_rename(file)
+def get_stat(logger, log_archives, processed_counter, errors_counter, files_index):
+    for log_archive in log_archives:
+        index = files_index[log_archive]
+        if processed_counter[index]:
+            err_rate = float(errors_counter[index]) / processed_counter[index]
+            logger.info(f'File {log_archive} statistics:')
+            if err_rate < NORMAL_ERR_RATE:
+                logger.info(f"Acceptable error rate ({err_rate}). Successfull load")
+            else:
+                logger.error(f"High error rate ({err_rate} > {NORMAL_ERR_RATE}). Failed load")
 
 
-def update_stat(counter, file, processed, errors):
-    part_result = counter[file]
-    part_result['errors'] += errors
-    part_result['processed'] += processed
-    counter[file] = part_result
-
-
-def handle_data(log_settings, data_queue, options, counter, synchronization):
+def handle_data(log_settings, data_queue, options, processed_counter, errors_counter, files_index):
+    log = log_settings['log']
     logger = logging.getLogger(__name__)
-    logger.addHandler(QueueHandler(log_settings['queue']))
     logger.setLevel(log_settings['level'])
+    handler = logging.FileHandler(log) if log else logging.StreamHandler()
+    handler.setFormatter(log_settings['formatter'])
+    logger.addHandler(handler)
 
     device_memc = {
         "idfa": options.idfa,
@@ -115,47 +103,70 @@ def handle_data(log_settings, data_queue, options, counter, synchronization):
         "dvid": options.dvid,
     }
 
+    counter = {}
+
     while True:
+        buffer = {}
         file, data = data_queue.get()
         if not data:
-            logger.debug("DONE")
-            return
-        if data == 'END':
-            synchronization.wait()  # чтоб get_stat выполнялось после завершения обработки всех кусков файла
-            continue
-        if data == 'CALC':
-            get_stat(logger, counter, file)
-            continue
+            logger.debug("Done")
+            break
+        if not counter.get(file):
+            counter[file] = {'processed': 0, 'errors': 0}
 
-        processed = errors = 0
         for line in data:
             appsinstalled = parse_appsinstalled(logger, line)
             if not appsinstalled:
-                errors += 1
+                counter[file]['errors'] += 1
                 continue
             memc_addr = device_memc.get(appsinstalled.dev_type)
             if not memc_addr:
-                errors += 1
+                counter[file]['errors'] += 1
                 logger.error("Unknow device type: %s" % appsinstalled.dev_type)
                 continue
-            ok = insert_appsinstalled(logger, memc_addr, appsinstalled, options.dry)
-            if ok:
-                processed += 1
-            else:
-                errors += 1
 
-        update_stat(counter, file, processed, errors)
+            ua, key, packed = serialize_data(appsinstalled)
+
+            try:
+                if options.dry:
+                    logger.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+                    counter[file]['processed'] += 1
+                else:
+                    if not buffer.get(memc_addr):
+                        buffer[memc_addr] = {}
+                    buffer[memc_addr].update({key: packed})
+            except Exception as e:
+                logger.exception("Cannot write to memc %s: %s" % (memc_addr, e))
+                counter[file]['errors'] += 1
+
+        for addr, data in buffer.items():
+            memc = memcache.Client(servers=[addr], socket_timeout=MEMC_SOCKET_TIMEOUT, dead_retry=MEMC_DEAD_RETRY)
+            notstored = len(memc.set_multi(data))
+            counter[file]['errors'] += notstored
+            counter[file]['processed'] += len(data) - notstored
+
+    with processed_counter.get_lock():
+        for key, value in counter.items():
+            index = files_index[key]
+            processed_counter[index] += counter[key]['processed']
+    with errors_counter.get_lock():
+        for key, value in counter.items():
+            index = files_index[key]
+            errors_counter[index] += counter[key]['errors']
 
 
-def main(options):
+def main(options, logger):
     data_queue = Queue(QUEUE_MAXSIZE)
     log_archives = list(glob.iglob(options.pattern))
-    counter = Manager().dict({i: {'processed': 0, 'errors': 0} for i in log_archives})
-    synchronization = Barrier(PROCESS_VALUE)
+    files_count = len(log_archives)
+    processed_counter = Array('i', files_count)
+    errors_counter = Array('i', files_count)
+    files_index = {file: _id for _id, file in enumerate(log_archives)}
 
     workers = []
     for _ in range(PROCESS_VALUE):
-        worker = Process(target=handle_data, args=(log_settings, data_queue, options, counter, synchronization))
+        worker = Process(target=handle_data, args=(log_settings, data_queue, options,
+                                                   processed_counter, errors_counter, files_index))
         worker.start()
         workers.append(worker)
 
@@ -167,11 +178,13 @@ def main(options):
             data_queue.put((fn, data))
             data = list(islice(fd, READ_LINES))
         fd.close()
-        [data_queue.put((fn, 'END')) for _ in range(PROCESS_VALUE)]  # синхронизация при завершении файла
-        data_queue.put((fn, 'CALC'))  # для подсчета статистики
-    [data_queue.put((None, None)) for _ in range(PROCESS_VALUE)]  # признак для завершения работы процесса
+        dot_rename(fn)
 
+    [data_queue.put((None, None)) for _ in range(PROCESS_VALUE)]
     [worker.join() for worker in workers]
+
+    if log_archives:
+        get_stat(logger, log_archives, processed_counter, errors_counter, files_index)
 
 
 if __name__ == '__main__':
@@ -194,11 +207,7 @@ if __name__ == '__main__':
                                   datefmt='%Y.%m.%d %H:%M:%S')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger_queue = Queue(-1)
-    queue_listener = QueueListener(logger_queue, handler)
-    queue_listener.start()
-    log_settings = {'queue': logger_queue,
-                    'level': log_level}
+    log_settings = {'level': log_level, 'formatter': formatter, 'log': opts.log}
 
     if opts.test:
         prototest()
@@ -206,9 +215,7 @@ if __name__ == '__main__':
 
     logger.info("Memc loader started with options: %s" % opts)
     try:
-        main(opts)
+        main(opts, logger)
     except Exception as e:
         logger.exception("Unexpected error: %s" % e)
         sys.exit(1)
-    finally:
-        queue_listener.stop()
