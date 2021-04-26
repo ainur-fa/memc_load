@@ -5,6 +5,7 @@ import gzip
 import sys
 import glob
 import logging
+from logging.handlers import QueueListener, QueueHandler
 import collections
 from optparse import OptionParser
 from multiprocessing import Process, Queue, Array
@@ -20,7 +21,7 @@ NORMAL_ERR_RATE = 0.01
 READ_LINES = 100000
 PROCESS_VALUE = 4
 QUEUE_MAXSIZE = 4
-MEMC_SOCKET_TIMEOUT = 5
+MEMC_SOCKET_TIMEOUT = 120
 MEMC_DEAD_RETRY = 2
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
@@ -89,12 +90,9 @@ def get_stat(logger, log_archives, processed_counter, errors_counter, files_inde
 
 
 def handle_data(log_settings, data_queue, options, processed_counter, errors_counter, files_index):
-    log = log_settings['log']
     logger = logging.getLogger(__name__)
+    logger.addHandler(QueueHandler(log_settings['queue']))
     logger.setLevel(log_settings['level'])
-    handler = logging.FileHandler(log) if log else logging.StreamHandler()
-    handler.setFormatter(log_settings['formatter'])
-    logger.addHandler(handler)
 
     device_memc = {
         "idfa": options.idfa,
@@ -104,7 +102,7 @@ def handle_data(log_settings, data_queue, options, processed_counter, errors_cou
     }
 
     counter = {}
-
+    memc_connections = {}
     while True:
         buffer = {}
         file, data = data_queue.get()
@@ -140,8 +138,11 @@ def handle_data(log_settings, data_queue, options, processed_counter, errors_cou
                 counter[file]['errors'] += 1
 
         for addr, data in buffer.items():
-            memc = memcache.Client(servers=[addr], socket_timeout=MEMC_SOCKET_TIMEOUT, dead_retry=MEMC_DEAD_RETRY)
-            notstored = len(memc.set_multi(data))
+            if not memc_connections.get(addr):
+                memc_connections[addr] = memcache.Client(servers=[addr],
+                                                         socket_timeout=MEMC_SOCKET_TIMEOUT,
+                                                         dead_retry=MEMC_DEAD_RETRY)
+            notstored = len(memc_connections[addr].set_multi(data))
             counter[file]['errors'] += notstored
             counter[file]['processed'] += len(data) - notstored
 
@@ -155,7 +156,7 @@ def handle_data(log_settings, data_queue, options, processed_counter, errors_cou
             errors_counter[index] += counter[key]['errors']
 
 
-def main(options, logger):
+def main(options):
     data_queue = Queue(QUEUE_MAXSIZE)
     log_archives = list(glob.iglob(options.pattern))
     files_count = len(log_archives)
@@ -207,7 +208,10 @@ if __name__ == '__main__':
                                   datefmt='%Y.%m.%d %H:%M:%S')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    log_settings = {'level': log_level, 'formatter': formatter, 'log': opts.log}
+    logger_queue = Queue(-1)
+    queue_listener = QueueListener(logger_queue, handler)
+    queue_listener.start()
+    log_settings = {'queue': logger_queue, 'level': log_level}
 
     if opts.test:
         prototest()
@@ -215,7 +219,7 @@ if __name__ == '__main__':
 
     logger.info("Memc loader started with options: %s" % opts)
     try:
-        main(opts, logger)
+        main(opts)
     except Exception as e:
         logger.exception("Unexpected error: %s" % e)
         sys.exit(1)
